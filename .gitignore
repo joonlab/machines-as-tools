@@ -1,0 +1,40 @@
+# 실제 설정(개인 호스트·경로)은 저장소 밖(~/.config/machines-as-tools/)에 둔다
+config.json
+*.local.json
+.env
+*.env
+
+# 실행 결과·장부·로그
+results/
+out/
+build_remote/
+out_remote/
+*.ledger.jsonl
+ledger*.jsonl
+*.log
+
+# 파이썬
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# 도구(hands) 산출물 — 기본값은 저장소 밖(~/.local/share/machines-as-tools/)이지만 --out 등으로 안에 둔 경우 대비
+LEDGER*.jsonl
+*.jsonl.lock
+hands/*/out/
+hands/*/runs/
+hands/*/results/
+build_remote/
+out_remote/
+candidates.tsv
+cards.md
+*.trace.json
+
+# 따라 하며 만든 개인 작업 파일
+jobs*.tsv
+report*.md
+hands/*/reports/

@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# mm — 기기를 도구로(machines-as-tools) 실행기. 지휘 맥의 세션 하나가 다른 맥을 자기 도구처럼 부른다.
+#
+# 계단식 배정 (싼 것부터):
+#   T0  mm <host> run "<셸>"                    LLM 0. 결정론 작업 (빌드·렌더·집계)
+#   T0  mm <host> read-url <url> [글자수]        LLM 0. 원격 cmux 브라우저로 열기→본문→닫기
+#   T0  mm <host> browser <cmux browser 인자…>   LLM 0. 원격 GUI cmux 브라우저 세부 조작
+#       mm <host> close-tab <surface:N>
+#   T1  mm <host> ask [-m haiku|sonnet|opus] [-b brief.md] [-r <worker-id>] "<지시>"
+#                                               가벼운 작업자(빈 설정 디렉터리). -r 로 같은 작업자 이어 쓰기
+#   T3  mm <host> fork <session-id> "<지시>"     지휘 세션 대화 전체 복제(비쌈, 최후 수단)
+#   --  mm batch <jobs.tsv>                     여러 작업 동시 실행 → 결과는 파일, 요약표만 출력
+#                                               jobs.tsv 한 줄 = id<TAB>host<TAB>mm 인자들(탭 구분)
+#   --  mm status                               설정된 모든 기기의 메모리·claude 수·부하
+#   --  mm hosts                                설정 검증 + 호스트·역할 목록
+#
+# <host> 는 설정 파일(hosts.<이름>)에 적힌 이름만 받는다. 설정: $MAT_CONFIG 또는 ~/.config/machines-as-tools/config.json
+# 원칙: 지휘 세션으로 돌아오는 출력은 짧게. 긴 결과는 파일로.
+set -euo pipefail
+
+SELF="$0"
+BIN="$(cd "$(dirname "$0")" && pwd)"
+LIB="$(cd "$BIN/../lib" && pwd)"
+PY="${MAT_PYTHON:-python3}"
+
+usage(){ sed -n 2,19p "$SELF"; }
+cfg(){ "$PY" "$LIB/config.py" "$@"; }
+load_vars(){  # 설정을 셸 변수(MAT_*)로 읽는다. 실패하면 config.py 가 이유를 stderr 로 말한다
+  local v; v=$(cfg shell "$@") || exit 3; eval "$v"
+}
+
+host=${1:-}; cmd=${2:-}
+case "$host" in
+  status|batch|hosts) cmd=$host; load_vars ;;
+  ""|-h|--help|help) usage; exit 1 ;;
+  *) load_vars "$host" ;;
+esac
+
+LOG="$MAT_STATE_DIR/mm.log"
+mkdir -p "$MAT_SSH_CMDIR"
+SSHO=(-o "ConnectTimeout=$MAT_SSH_TIMEOUT" -o BatchMode=yes -o ControlMaster=auto
+      -o "ControlPath=$MAT_SSH_CMDIR/%r@%h:%p" -o "ControlPersist=$MAT_SSH_PERSIST")
+
+b64(){ printf '%s' "$1" | base64 | tr -d '\n'; }
+note(){ printf '%s\t%s\t%s\n' "$(date '+%F %T')" "$1" "$2" >>"$LOG"; }
+now(){ "$PY" -c 'import time;print(time.time())'; }
+excerpt(){  # 결과 파일 앞 두 줄(빈 줄 제외)을 110자로. 바이트 단위로 잘린 UTF-8 도 깨지지 않게
+  "$PY" -c 'import sys;L=[l.strip() for l in open(sys.argv[1],encoding="utf-8",errors="replace") if l.strip()];print(" ".join(L[:2])[:110])' "$1"; }
+on(){  # on <ssh별칭|local> <셸 문자열>
+  local s=$1; shift
+  if [ "$s" = local ]; then bash -c "$*"; else ssh "${SSHO[@]}" "$s" "$*"; fi
+}
+model_id(){
+  local a=${1:-$MAT_DEFAULT_MODEL} var
+  var="MAT_MODEL_$(printf '%s' "$a" | tr '[:lower:]-' '[:upper:]_')"
+  if [ -n "${!var:-}" ]; then echo "${!var}"; else echo "$a"; fi   # 별칭이 없으면 모델 ID 로 간주
+}
+token_prefix(){ [ -n "$MAT_TOKEN_ENV" ] && printf 'set -a; . %s; set +a; ' "$MAT_TOKEN_ENV" || true; }
+cmux_prefix(){ printf 'CMUX_SOCKET_PASSWORD=%q %s' "$(cfg password "$host")" "$MAT_CMUX"; }
+need_ask(){
+  [ "$MAT_CAN_ASK" = 1 ] || {
+    echo "mm: '$host' 는 can_ask=false 다(claude 작업자를 띄우지 않는 기기). ask 가능: $(for h in $MAT_HOSTS; do [ "$(cfg get "hosts.$h.can_ask")" = true ] && printf '%s ' "$h"; done)" >&2
+    exit 2; }
+}
+
+case "$cmd" in
+  run)
+    shift 2; note "$host" "run $*"; on "$MAT_SSH" "$*" ;;
+
+  browser)
+    shift 2; note "$host" "browser $*"
+    on "$MAT_SSH" "$(cmux_prefix) browser $(printf '%q ' "$@")" ;;
+
+  read-url)
+    # T0 묶음: 열기 → 대기 → 본문(앞 N바이트) → 반드시 닫기
+    url=${3:?url 이 필요}; n=${4:-4000}
+    [[ "$n" =~ ^[0-9]+$ ]] || { echo "mm: 글자수는 숫자" >&2; exit 2; }
+    note "$host" "read-url $url"
+    s=$("$SELF" "$host" browser open "$url" | grep -oE 'surface:[0-9]+' | head -1 || true)
+    [ -n "$s" ] || { echo "mm: 탭 열기 실패" >&2; exit 1; }
+    trap '"$SELF" "$host" close-tab "$s" >/dev/null 2>&1 || true' EXIT
+    "$SELF" "$host" browser "$s" wait --load-state complete --timeout-ms 20000 >/dev/null || true
+    "$SELF" "$host" browser "$s" get text body | head -c "$n"; echo ;;
+
+  close-tab)
+    # 인자가 비면 cmux 가 호출자 자신의 탭을 닫는다 → surface:N 형식만 허용
+    [[ "${3:-}" =~ ^surface:[0-9]+$ ]] || { echo "mm: close-tab 은 surface:N 이 필요" >&2; exit 2; }
+    note "$host" "close-tab $3"
+    win=$(on "$MAT_SSH" "$(cmux_prefix) tree --all --json" | "$PY" -c '
+import json,sys
+raw=sys.stdin.read(); t=json.loads(raw[raw.find("{"):])
+for w in t.get("windows",[]):
+  for ws in w.get("workspaces",[]):
+    for pn in ws.get("panes",[]):
+      for sf in pn.get("surfaces",[]):
+        if sys.argv[1] in (sf.get("ref"),sf.get("id")): print(w.get("ref") or w.get("id")); sys.exit()
+' "$3")
+    [ -n "$win" ] || { echo "mm: $3 을 $host 에서 못 찾음(이미 닫힘?)" >&2; exit 0; }
+    on "$MAT_SSH" "$(cmux_prefix) close-surface --surface $3 --window $win" ;;
+
+  ask)
+    need_ask
+    shift 2; model=$MAT_DEFAULT_MODEL; brief=""; resume=""
+    while getopts "m:b:r:" o; do case $o in m) model=$OPTARG;; b) brief=$(cat "$OPTARG");; r) resume=$OPTARG;; *) exit 2;; esac; done
+    shift $((OPTIND-1))
+    [ -z "$resume" ] || [[ "$resume" =~ ^[A-Za-z0-9-]+$ ]] || { echo "mm: -r 값이 이상하다" >&2; exit 2; }
+    task="$*"; [ -n "$task" ] || { echo "mm: 지시가 비어 있다" >&2; exit 2; }
+    [ -n "$brief" ] && task="[배경 브리프]
+$brief
+
+[할 일]
+$task"
+    note "$host" "ask -m $model ${resume:+-r $resume} (${#task}자)"
+    out=$(mktemp); err=$(mktemp)
+    L=$MAT_LEAN_DIR; W=$MAT_WORKDIR
+    on "$MAT_SSH" "$(token_prefix)mkdir -p $W $L; [ -f $L/settings.json ] || echo '{}' > $L/settings.json; cd $W && CLAUDE_CONFIG_DIR=$L $MAT_CLAUDE -p \"\$(echo $(b64 "$task") | base64 -d)\" --output-format json --strict-mcp-config --disable-slash-commands --setting-sources '' --tools $MAT_TOOLS --allowedTools $MAT_TOOLS --model $(model_id "$model") --append-system-prompt \"\$(echo $(b64 "$MAT_RULES") | base64 -d)\" ${resume:+-r $resume}" >"$out" 2>"$err" || true
+    meta=$("$PY" "$LIB/cjson.py" "$out" 2>&1 || true)
+    note "$host" "ask-done $meta"
+    rc=0
+    "$PY" "$LIB/cjson.py" --human "$out" 2>/dev/null || { rc=1; echo "mm: ask 실패"; head -c 600 "$out"; head -c 600 "$err"; }
+    # 임시 파일은 지우지 않는다(mktemp 위치 = OS 가 정리하는 임시 폴더)
+    exit $rc ;;
+
+  fork)
+    need_ask
+    sid=${3:?session-id 가 필요}; shift 3
+    [[ "$sid" =~ ^[A-Za-z0-9-]+$ ]] || { echo "mm: session-id 형식이 이상하다" >&2; exit 2; }
+    note "$host" "fork $sid"
+    on "$MAT_SSH" "$(token_prefix)cd ~ && $MAT_CLAUDE -r $sid --fork-session -p \"\$(echo $(b64 "$*") | base64 -d)\" --output-format json" ;;
+
+  batch)
+    jobs=${2:?jobs.tsv 가 필요}; rd="$MAT_STATE_DIR/results/$(date +%Y%m%d-%H%M%S)-$$"; mkdir -p "$rd"
+    t0=$(now)
+    while IFS=$'\t' read -r id h rest || [ -n "${id:-}" ]; do
+      { [ -z "${id:-}" ] || [[ "$id" == \#* ]]; } && continue
+      IFS=$'\t' read -r -a a <<<"$rest"
+      ( s=$(now); rc=0; "$SELF" "$h" "${a[@]}" >"$rd/$id.out" 2>&1 || rc=$?
+        e=$(now); printf '%s\t%s\t%s\t%.1f\t%s\t%s\t%s\n' "$id" "$h" "$rc" "$("$PY" -c "print($e-$s)")" "$s" "$e" "${a[0]}" >"$rd/$id.meta" ) &
+    done <"$jobs"
+    wait
+    printf 'batch %s  wall=%.1fs  results=%s\n' "$(basename "$jobs")" "$("$PY" -c "import time;print(time.time()-$t0)")" "$rd"
+    for m in "$rd"/*.meta; do [ -e "$m" ] || continue; IFS=$'\t' read -r id h rc secs _ <"$m"
+      printf '  %-14s %-9s rc=%s %5ss | %s\n' "$id" "$h" "$rc" "$secs" "$(excerpt "$rd/$id.out")"; done ;;
+
+  status)
+    # 기기마다 동시에 묻고 설정 순서대로 출력. 이름은 설정의 호스트 이름(실제 hostname 은 출력하지 않는다)
+    td=$(mktemp -d)
+    for h in $MAT_HOSTS; do
+      ( s=$(cfg get "hosts.$h.ssh")
+        if [ "$s" = local ]; then bash -s; else ssh "${SSHO[@]}" "$s" bash -s; fi <<'EOS' 2>/dev/null | tr -d '\033' | grep -E '^[0-9]' >"$td/$h" || true
+mem=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+free=$(memory_pressure 2>/dev/null | tail -1 | grep -oE '[0-9]+%' || echo '?')
+printf '%s %s %s %s %s\n' "$mem" "$free" "$(pgrep -x claude | wc -l | tr -d ' ')" "$(sysctl -n vm.loadavg | awk '{print $2}')" "$(sysctl -n hw.ncpu)"
+EOS
+      ) &
+    done
+    wait
+    for h in $MAT_HOSTS; do
+      if [ -s "$td/$h" ]; then read -r mem free n load cores <"$td/$h"
+        printf '%-12s %3sGB  free=%-4s claude=%-3s load1=%-5s cores=%s\n' "$h" "$mem" "$free" "$n" "$load" "$cores"
+      else printf '%-12s unreachable\n' "$h"; fi
+    done ;;
+
+  hosts)
+    cfg check ;;
+
+  *) usage; exit 1 ;;
+esac
